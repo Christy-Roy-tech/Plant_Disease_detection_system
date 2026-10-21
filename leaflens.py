@@ -280,6 +280,10 @@ class Settings:
             self.data.update(json.loads(self.path.read_text()))
         except Exception:
             pass
+        configured_models = Path(self.data["models_dir"])
+        default_models = Path(DEFAULTS["models_dir"])
+        if not configured_models.is_dir() and default_models.is_dir():
+            self.data["models_dir"] = str(default_models)
 
     def __getitem__(self, k):
         return self.data[k]
@@ -341,10 +345,21 @@ def find_model(models_dir, crop):
         for c in cfgs:
             if c.is_file():
                 try:
-                    cfg = json.loads(c.read_text())
-                    if cfg.get("crop", crop).lower() != crop:
-                        continue
-                    return ModelInfo(crop, onnx_files[0], cfg)
+                    text = c.read_text()
+                    decoder = json.JSONDecoder()
+                    offset = 0
+                    while offset < len(text):
+                        while offset < len(text) and text[offset].isspace():
+                            offset += 1
+                        if offset >= len(text):
+                            break
+                        cfg, end = decoder.raw_decode(text, offset)
+                        offset = end
+                        if not isinstance(cfg, dict):
+                            continue
+                        if str(cfg.get("crop", crop)).lower() != crop:
+                            continue
+                        return ModelInfo(crop, onnx_files[0], cfg)
                 except Exception:
                     continue
     return None
