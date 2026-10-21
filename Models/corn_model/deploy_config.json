@@ -1,0 +1,28 @@
+{
+  "crop": "Corn",
+  "model": "efficientnet_b0",
+  "class_names": [
+    "Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot",
+    "Corn_(maize)___Common_rust_",
+    "Corn_(maize)___Northern_Leaf_Blight",
+    "Corn_(maize)___healthy"
+  ],
+  "img_size": 224,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "temperature": 0.49615463614463806,
+  "conf_high": 0.85,
+  "conf_low": 0.5,
+  "test_accuracy": 0.9897,
+  "test_macro_f1": 0.985,
+  "preprocess": "RGB -> resize to (img_size, img_size) -> /255 -> normalize(mean, std) -> NCHW float32",
+  "postprocess": "softmax(logits / temperature); average over frames; apply thresholds"
+}

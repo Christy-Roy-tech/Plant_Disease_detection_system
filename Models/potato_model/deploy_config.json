@@ -1,0 +1,24 @@
+{
+  "crop": "Potato",
+  "model": "mobilenet_v2",
+  "class_names": [
+    "Potato___Early_blight",
+    "Potato___Late_blight",
+    "Potato___healthy"
+  ],
+  "img_size": 224,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "temperature": 1.0,
+  "conf_high": 0.85,
+  "conf_low": 0.5,
+  "test_accuracy": 0.0
+}
