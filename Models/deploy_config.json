@@ -104,3 +104,37 @@
   "conf_low": 0.5,
   "test_accuracy": 0.0
 }
+{
+  "crop": "Tomato",
+  "model": "efficientnet_b0",
+  "class_names": [
+    "Tomato___Bacterial_spot",
+    "Tomato___Early_blight",
+    "Tomato___Late_blight",
+    "Tomato___Leaf_Mold",
+    "Tomato___Septoria_leaf_spot",
+    "Tomato___Spider_mites Two-spotted_spider_mite",
+    "Tomato___Target_Spot",
+    "Tomato___Tomato_Yellow_Leaf_Curl_Virus",
+    "Tomato___Tomato_mosaic_virus",
+    "Tomato___healthy"
+  ],
+  "img_size": 224,
+  "mean": [
+    0.485,
+    0.456,
+    0.406
+  ],
+  "std": [
+    0.229,
+    0.224,
+    0.225
+  ],
+  "temperature": 0.12493295967578888,
+  "conf_high": 0.85,
+  "conf_low": 0.5,
+  "test_accuracy": 0.9985,
+  "test_macro_f1": 0.9981,
+  "preprocess": "RGB -> resize to (img_size, img_size) -> /255 -> normalize(mean, std) -> NCHW float32",
+  "postprocess": "softmax(logits / temperature); average over frames; apply thresholds"
+}
