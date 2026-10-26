@@ -18,7 +18,7 @@ from datetime import datetime
 import numpy as np
 import cv2
 import onnxruntime as ort
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import Qt, Signal, QThread, QSize, QPoint, QRectF, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPainterPath, QPen,
                            QPixmap)
@@ -46,6 +46,7 @@ DEFAULTS = dict(
     conf_high=85, conf_low=50,
     esp_url="http://192.168.4.1/capture", esp_size=8, webcam_index=0,
     bg_removal=False, use_gpu=True, block_poor=True, min_sharpness=15.0, min_leaf_area=10,
+    crop_mode="center_crop", use_calibration=False,
 )
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -277,7 +278,7 @@ class Settings:
         self.path = APP_DIR / "settings.json"
         self.data = dict(DEFAULTS)
         try:
-            self.data.update(json.loads(self.path.read_text()))
+            self.data.update(json.loads(self.path.read_text(encoding="utf-8")))
         except Exception:
             pass
         configured_models = Path(self.data["models_dir"])
@@ -286,7 +287,10 @@ class Settings:
             self.data["models_dir"] = str(default_models)
 
     def __getitem__(self, k):
-        return self.data[k]
+        return self.data.get(k, DEFAULTS.get(k))
+
+    def get(self, k, default=None):
+        return self.data.get(k, DEFAULTS.get(k, default))
 
     def set(self, k, v):
         self.data[k] = v
@@ -294,16 +298,50 @@ class Settings:
 
     def save(self):
         APP_DIR.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2))
+        self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
 
     def reset(self):
-        keep = {k: self.data[k] for k in ("models_dir",)}
+        keep = {k: self.data[k] for k in ("models_dir",) if k in self.data}
         self.data = dict(DEFAULTS); self.data.update(keep); self.save()
 
 
 # ----------------------------------------------------------------------------------------------------------------
 # Models
 # ----------------------------------------------------------------------------------------------------------------
+DEFAULT_CONFIGS = {
+    "apple": {
+        "crop": "Apple", "model": "efficientnet_b0",
+        "class_names": ["Apple___Apple_scab", "Apple___Black_rot", "Apple___Cedar_apple_rust", "Apple___healthy"],
+        "img_size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225],
+        "temperature": 1.0, "conf_high": 0.85, "conf_low": 0.5, "test_accuracy": 1.0
+    },
+    "corn": {
+        "crop": "Corn", "model": "efficientnet_b0",
+        "class_names": ["Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot", "Corn_(maize)___Common_rust_", "Corn_(maize)___Northern_Leaf_Blight", "Corn_(maize)___healthy"],
+        "img_size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225],
+        "temperature": 1.0, "conf_high": 0.85, "conf_low": 0.5, "test_accuracy": 0.9897
+    },
+    "potato": {
+        "crop": "Potato", "model": "mobilenet_v2",
+        "class_names": ["Potato___Early_blight", "Potato___Late_blight", "Potato___healthy"],
+        "img_size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225],
+        "temperature": 1.0, "conf_high": 0.85, "conf_low": 0.5, "test_accuracy": 1.0
+    },
+    "strawberry": {
+        "crop": "Strawberry", "model": "efficientnet_b0",
+        "class_names": ["Strawberry___Leaf_scorch", "Strawberry___healthy"],
+        "img_size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225],
+        "temperature": 1.0, "conf_high": 0.85, "conf_low": 0.5, "test_accuracy": 1.0
+    },
+    "tomato": {
+        "crop": "Tomato", "model": "efficientnet_b0",
+        "class_names": ["Tomato___Bacterial_spot", "Tomato___Early_blight", "Tomato___Late_blight", "Tomato___Leaf_Mold", "Tomato___Septoria_leaf_spot", "Tomato___Spider_mites Two-spotted_spider_mite", "Tomato___Target_Spot", "Tomato___Tomato_Yellow_Leaf_Curl_Virus", "Tomato___Tomato_mosaic_virus", "Tomato___healthy"],
+        "img_size": 224, "mean": [0.485, 0.456, 0.406], "std": [0.229, 0.224, 0.225],
+        "temperature": 1.0, "conf_high": 0.85, "conf_low": 0.5, "test_accuracy": 0.9985
+    }
+}
+
+
 def gpu_available():
     return "CUDAExecutionProvider" in ort.get_available_providers()
 
@@ -336,16 +374,33 @@ def find_model(models_dir, crop):
     root = Path(models_dir)
     if not root.is_dir():
         return None
-    dirs = [d for d in sorted(root.iterdir()) if d.is_dir() and crop in d.name.lower()] + [root]
+    crop_lower = crop.lower()
+    dirs = [d for d in sorted(root.iterdir()) if d.is_dir() and crop_lower in d.name.lower()] + [root]
     for d in dirs:
-        onnx_files = [p for p in sorted(d.glob("*.onnx")) if d != root or crop in p.name.lower()]
+        onnx_files = [p for p in sorted(d.glob("*.onnx")) if d != root or crop_lower in p.name.lower()]
         if not onnx_files:
             continue
         cfgs = [d / "deploy_config.json"] + sorted(d.glob(f"*{crop}*config*.json")) + sorted(d.glob("*config*.json"))
         for c in cfgs:
             if c.is_file():
                 try:
-                    text = c.read_text()
+                    text = c.read_text(encoding="utf-8")
+                    # Try standard JSON first (dict or list)
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            if str(parsed.get("crop", "")).lower() == crop_lower:
+                                return ModelInfo(crop, onnx_files[0], parsed)
+                            elif crop_lower in parsed and isinstance(parsed[crop_lower], dict):
+                                return ModelInfo(crop, onnx_files[0], parsed[crop_lower])
+                        elif isinstance(parsed, list):
+                            for item in parsed:
+                                if isinstance(item, dict) and str(item.get("crop", "")).lower() == crop_lower:
+                                    return ModelInfo(crop, onnx_files[0], item)
+                    except json.JSONDecodeError:
+                        pass
+
+                    # Fallback for concatenated JSON objects
                     decoder = json.JSONDecoder()
                     offset = 0
                     while offset < len(text):
@@ -357,11 +412,13 @@ def find_model(models_dir, crop):
                         offset = end
                         if not isinstance(cfg, dict):
                             continue
-                        if str(cfg.get("crop", crop)).lower() != crop:
-                            continue
-                        return ModelInfo(crop, onnx_files[0], cfg)
+                        if str(cfg.get("crop", crop)).lower() == crop_lower:
+                            return ModelInfo(crop, onnx_files[0], cfg)
                 except Exception:
                     continue
+        # Fallback to default built-in configuration if config file is absent
+        if crop_lower in DEFAULT_CONFIGS:
+            return ModelInfo(crop, onnx_files[0], DEFAULT_CONFIGS[crop_lower])
     return None
 
 
@@ -428,11 +485,17 @@ def guidance_for(label):
 # Image processing
 # ----------------------------------------------------------------------------------------------------------------
 def load_rgb(path):
-    data = np.fromfile(str(path), np.uint8)
-    bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise ValueError(f"Could not read image: {path}")
-    return limit_size(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+    try:
+        with Image.open(str(path)) as im:
+            im = ImageOps.exif_transpose(im)
+            rgb = np.array(im.convert("RGB"))
+            return limit_size(rgb)
+    except Exception:
+        data = np.fromfile(str(path), np.uint8)
+        bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if bgr is None:
+            raise ValueError(f"Could not read image: {path}")
+        return limit_size(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
 
 
 def limit_size(rgb, max_side=1600):
@@ -449,18 +512,23 @@ def qimage_from_rgb(rgb):
 
 
 def plant_mask(rgb):
+    # Detect healthy greens/yellows as well as diseased browns/lesions
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    m = ((h >= 8) & (h <= 95) & (s >= 40) & (v >= 40)).astype(np.uint8) * 255
+    green_yellow = (h >= 15) & (h <= 95) & (s >= 30) & (v >= 30)
+    lesion_brown = (h >= 5) & (h <= 25) & (s >= 25) & (v >= 20)
+    m = (green_yellow | lesion_brown).astype(np.uint8) * 255
     k = max(3, (min(rgb.shape[:2]) // 40) | 1)
     m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     out = np.zeros_like(m)
-    min_area = 0.02 * m.size
+    min_area = 0.01 * m.size
     for c in cnts:
         if cv2.contourArea(c) >= min_area:
-            cv2.drawContours(out, [c], -1, 255, thickness=-1)
+            # Use convex hull to enclose interior necrotic spots and lesions
+            hull = cv2.convexHull(c)
+            cv2.drawContours(out, [hull], -1, 255, thickness=-1)
     return out
 
 
@@ -490,15 +558,27 @@ def assess_quality(rgb, st):
     return dict(blur=blur, area=area, ok=not problems, problems=problems)
 
 
-def preprocess(rgb, info, bg_removal):
+def center_crop_square(pil_img):
+    w, h = pil_img.size
+    s = min(w, h)
+    left = (w - s) // 2
+    top = (h - s) // 2
+    return pil_img.crop((left, top, left + s, top + s))
+
+
+def preprocess(rgb, info, bg_removal=False, crop_mode="center_crop"):
     if bg_removal:
         rgb = remove_background(rgb)
-    s = info.img_size
-    pil = Image.fromarray(rgb).resize((s, s), Image.BILINEAR)
+    s = getattr(info, "img_size", 224) if info else 224
+    pil = Image.fromarray(rgb).convert("RGB")
+    if crop_mode == "center_crop":
+        pil = center_crop_square(pil)
+    pil = pil.resize((s, s), Image.BILINEAR)
     return rgb, pil
 
 
 def to_tensor(pil, info):
+    pil = pil.convert("RGB")
     x = np.asarray(pil, np.float32).transpose(2, 0, 1) / 255.0
     return (x - info.mean) / info.std
 
@@ -509,14 +589,16 @@ def softmax(z):
     return e / e.sum(axis=1, keepdims=True)
 
 
-def run_inference(info, frames, bg_removal, use_gpu):
+def run_inference(info, frames, bg_removal=False, use_gpu=True, crop_mode="center_crop", use_calibration=False):
     batch = []
     for f in frames:
-        _, pil = preprocess(f, info, bg_removal)
+        _, pil = preprocess(f, info, bg_removal, crop_mode)
         x = to_tensor(pil, info)
         batch.extend([x, np.ascontiguousarray(x[:, :, ::-1])])      # frame + its mirror image
     sess = info.session(use_gpu)
-    logits = sess.run(None, {sess.get_inputs()[0].name: np.stack(batch).astype(np.float32)})[0] / info.temperature
+    temp = info.temperature if use_calibration else 1.0
+    temp = max(temp, 0.05)
+    logits = sess.run(None, {sess.get_inputs()[0].name: np.stack(batch).astype(np.float32)})[0] / temp
     return softmax(logits).mean(axis=0)
 
 
@@ -527,13 +609,15 @@ class InferWorker(QThread):
     done = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, info, frames, bg_removal, use_gpu):
+    def __init__(self, info, frames, bg_removal, use_gpu, crop_mode="center_crop", use_calibration=False):
         super().__init__()
         self.info, self.frames, self.bg, self.gpu = info, frames, bg_removal, use_gpu
+        self.crop_mode = crop_mode
+        self.use_calibration = use_calibration
 
     def run(self):
         try:
-            self.done.emit(run_inference(self.info, self.frames, self.bg, self.gpu))
+            self.done.emit(run_inference(self.info, self.frames, self.bg, self.gpu, self.crop_mode, self.use_calibration))
         except Exception as e:                                       # noqa
             self.failed.emit(str(e))
 
@@ -853,7 +937,8 @@ class ModelStatusDialog(QDialog):
             rows += [("Model file", info.onnx_path.name),
                      ("Test accuracy", f"{acc * 100:.1f}%  (from deploy_config.json)" if isinstance(acc, (int, float)) else "not recorded"),
                      ("Classes", f"{len(info.class_names)}"), ("Input size", f"{info.img_size} x {info.img_size}"),
-                     ("Calibration T", f"{info.temperature:.3f}"), ("Backend", info.backend(st["use_gpu"]))]
+                     ("Calibration T", f"{info.temperature:.3f}" + (" (active)" if st.get("use_calibration", False) else " (inactive, T=1.0 raw)")),
+                     ("Backend", info.backend(st["use_gpu"]))]
         else:
             rows += [("Model file", "not found"), ("Looked in", st["models_dir"])]
         for i, (a, b) in enumerate(rows, start=1):
@@ -1081,6 +1166,10 @@ class SettingsPage(QWidget):
         self.s_low, self.v_low = self._slider(l1, "Uncertain threshold (amber)", "amber", 10, 95, st["conf_low"], "conf_low", "%d%%")
         self.red_lbl = QLabel(); self.red_lbl.setObjectName("muted"); l1.addWidget(self.red_lbl)
         self._update_red()
+        self.calib = QCheckBox("Enable temperature calibration (Warning: sharpens confidence)")
+        self.calib.setChecked(st.get("use_calibration", False))
+        self.calib.toggled.connect(lambda x: self._set("use_calibration", x))
+        l1.addWidget(self.calib)
         v.addWidget(c1)
 
         # --- esp32 + webcam
@@ -1106,6 +1195,14 @@ class SettingsPage(QWidget):
 
         # --- processing
         c3, l3 = self._section("Image processing")
+        row_crop = QHBoxLayout(); row_crop.addWidget(QLabel("Aspect ratio mode"))
+        self.crop_mode = QComboBox()
+        self.crop_mode.addItem("Center-crop square (preserves leaf proportions)", "center_crop")
+        self.crop_mode.addItem("Stretch to square (legacy)", "stretch")
+        crop_idx = max(0, self.crop_mode.findData(st.get("crop_mode", "center_crop")))
+        self.crop_mode.setCurrentIndex(crop_idx)
+        self.crop_mode.currentIndexChanged.connect(lambda: self._set("crop_mode", self.crop_mode.currentData()))
+        row_crop.addWidget(self.crop_mode, 1); l3.addLayout(row_crop)
         self.bg = QCheckBox("Apply leaf background removal (experimental)")
         self.bg.setChecked(st["bg_removal"]); self.bg.toggled.connect(lambda x: self._set("bg_removal", x)); l3.addWidget(self.bg)
         n = QLabel("Only helps if your models were trained on images processed the same way; otherwise leave it off."); n.setObjectName("muted"); n.setWordWrap(True); l3.addWidget(n)
@@ -1186,6 +1283,11 @@ class SettingsPage(QWidget):
         self.st.reset()
         for w, k in ((self.s_high, "conf_high"), (self.s_low, "conf_low")):
             w.setValue(int(self.st[k]))
+        if hasattr(self, "calib"):
+            self.calib.setChecked(self.st.get("use_calibration", False))
+        if hasattr(self, "crop_mode"):
+            idx = max(0, self.crop_mode.findData(self.st.get("crop_mode", "center_crop")))
+            self.crop_mode.setCurrentIndex(idx)
         self.esp_url.setText(self.st["esp_url"]); self.esp_size.setCurrentIndex(self.esp_size.findData(self.st["esp_size"]))
         self.cam.setValue(self.st["webcam_index"]); self.bg.setChecked(self.st["bg_removal"]); self.block.setChecked(self.st["block_poor"])
         self.sharp.setValue(self.st["min_sharpness"]); self.area.setValue(int(self.st["min_leaf_area"]))
@@ -1577,7 +1679,7 @@ class MainWindow(QWidget):
         if self.view_tab == "original":
             self.view.set_pixmap(QPixmap.fromImage(qimage_from_rgb(rgb)))
         else:
-            pre, pil = preprocess(rgb, info or type("I", (), {"img_size": 224})(), self.st["bg_removal"])
+            pre, pil = preprocess(rgb, info or type("I", (), {"img_size": 224})(), self.st["bg_removal"], self.st.get("crop_mode", "center_crop"))
             arr = np.asarray(pil)
             self.view.set_pixmap(QPixmap.fromImage(qimage_from_rgb(np.ascontiguousarray(arr))), smooth=False)
         self._set_quality(assess_quality(rgb, self.st))
@@ -1607,26 +1709,27 @@ class MainWindow(QWidget):
             QMessageBox.warning(self, APP_NAME, f"No {CROP_TITLE[self.crop]} model found.\n\nLooked in:\n{self.st['models_dir']}\n\nSet the models folder in Settings.")
             return
         quals = [assess_quality(f, self.st) for f in self.frames]
-        use = [f for f, q in zip(self.frames, quals) if q["ok"]]
+        poor_indices = [i for i, q in enumerate(quals) if not q["ok"]]
         note = ""
-        if len(use) < len(self.frames):
-            if use:
-                note = f"{len(self.frames) - len(use)} low-quality frame(s) were left out."
-            elif self.st["block_poor"]:
-                probs = sorted({p for q in quals for p in q["problems"]})
-                box = QMessageBox(self); box.setWindowTitle(APP_NAME); box.setIcon(QMessageBox.Warning)
-                box.setText("The image quality looks poor (" + ", ".join(probs) + ").")
-                box.setInformativeText("Results may be unreliable. Retake the photo, or analyse anyway.")
-                retake = box.addButton("Retake", QMessageBox.RejectRole); anyway = box.addButton("Analyse anyway", QMessageBox.AcceptRole)
-                box.exec()
-                if box.clickedButton() is not anyway:
-                    return
-                use = list(self.frames); note = "Analysed despite low image quality."
-            else:
-                use = list(self.frames)
+        use = list(self.frames)
+        if poor_indices and self.st["block_poor"]:
+            probs = sorted({p for i in poor_indices for p in quals[i]["problems"]})
+            box = QMessageBox(self); box.setWindowTitle(APP_NAME); box.setIcon(QMessageBox.Warning)
+            box.setText(f"{len(poor_indices)} of {len(self.frames)} frame(s) have potential quality issues (" + ", ".join(probs) + ").")
+            box.setInformativeText("Results may be less reliable. You can analyse anyway or retake.")
+            retake = box.addButton("Retake", QMessageBox.RejectRole)
+            anyway = box.addButton("Analyse anyway", QMessageBox.AcceptRole)
+            box.exec()
+            if box.clickedButton() != anyway:
+                return
+            note = f"Analysed with quality flags: {', '.join(probs)}."
+        elif poor_indices:
+            note = f"{len(poor_indices)} frame(s) had image quality warnings."
         self._used_frames = use; self._note = note
         self.analyze_btn.setEnabled(False); self.analyze_btn.setText("Analyzing...")
-        self.worker = InferWorker(info, use, self.st["bg_removal"], self.st["use_gpu"])
+        self.worker = InferWorker(info, use, self.st["bg_removal"], self.st["use_gpu"],
+                                  crop_mode=self.st.get("crop_mode", "center_crop"),
+                                  use_calibration=self.st.get("use_calibration", False))
         self.worker.done.connect(lambda probs, info=info: self._analysis_done(info, probs))
         self.worker.failed.connect(self._analysis_failed)
         self._run_thread(self.worker)
@@ -1674,11 +1777,11 @@ class MainWindow(QWidget):
         elif r["status"] == "uncertain_retake":
             self.res_title.setText(f"{CROP_TITLE[r['crop']]}: {r['label']}?")
             set_pill(self.res_badge, f"Uncertain   {pct}", AMBER, "#3A2E00", size=14)
-            self.res_hint.setText("Not sure yet - retake: move closer, avoid shadows and glare, keep the leaf in focus, and add another angle.")
+            self.res_hint.setText("Uncertain prediction - retake: move closer, avoid glare, keep leaf centered, or inspect runner-up classes below.")
         else:
             self.res_title.setText("Unknown")
             set_pill(self.res_badge, f"Low confidence   {pct}", RED, size=14)
-            self.res_hint.setText(f"Best guess was {r['label']}, but the model isn't sure. Check that the crop selection matches the plant and retake the photo.")
+            self.res_hint.setText(f"Best guess was {r['label']}, but confidence is low. Verify crop selection and compare candidate classes below.")
         rows = r["probs"] if self.show_all else r["probs"][:5]
         self.bars.set_rows(rows)
         if len(r["probs"]) > 5:
